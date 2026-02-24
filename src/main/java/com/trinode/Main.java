@@ -1,33 +1,39 @@
 package com.trinode;
 
-import com.trinode.config.NodeConfig;
-import com.trinode.core.Node;
-import com.trinode.storage.DataStore;
+import com.trinode.network.Message;
+import com.trinode.network.MessageType;
 
-import java.util.Map;
+import static com.trinode.network.MessageSerializer.deserialize;
+import static com.trinode.network.MessageSerializer.serialize;
 
 public class Main {
     public static void main(String[] args) {
-        NodeConfig config = new NodeConfig();
-        Map<Integer, String > allNodes = config.getAllNodes();
-        Node node1 = new Node(1);
-        Node node2 = new Node(2);
-        Node node3 = new Node(3);
 
-        node1.start();
-        node2.start();
-        node3.start();
+        System.out.println("Testing message serialization");
 
-        DataStore ds = node1.getData();
-        ds.put("kartikey","started the project");
-        System.out.println(ds.size());
-        String value = ds.get("kartikey");
-        System.out.println(value);
-        ds.delete("kartikey");
-        System.out.println(ds.size());
+        Message originalMessage = new Message();
 
-        node1.stop();
-        node2.stop();
-        node3.stop();
+        originalMessage.setType(MessageType.HEARTBEAT);
+        originalMessage.setSenderId(1);
+        originalMessage.setGeneration(5);
+        originalMessage.setPayload("test payload");
+
+        try {
+            // serialize
+            byte[] serialized = serialize(originalMessage);
+            System.out.println("Serialized message to " + serialized.length + " bytes");
+
+            // deserialize
+            Message deserializedMessage = deserialize(serialized);
+
+            System.out.println("Original type: " + originalMessage.getType());
+            System.out.println("Deserialized type : " + deserializedMessage.getType());
+            System.out.println("Match: " + (originalMessage.getType() == deserializedMessage.getType()));
+
+            System.out.println("SUCCESS");
+        } catch (Exception e) {
+            System.out.println("Serialization test: FAILED");
+            e.printStackTrace();
+        }
     }
 }
