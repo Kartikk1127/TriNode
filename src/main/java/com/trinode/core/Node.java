@@ -32,6 +32,10 @@ public class Node {
         this.networkManager = new NetworkManager(nodeId, port, config);
     }
 
+    public NetworkManager getNetworkManager() {
+        return networkManager;
+    }
+
     // start
     public void start() {
         if (isRunning.get()) {

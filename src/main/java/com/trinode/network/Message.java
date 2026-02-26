@@ -11,6 +11,13 @@ public class Message implements Serializable {
     // we add serial version id because in case of serialization, let's say you serialize a message object today and tomorrow you add a new field to this class, if you try to deserialize the bytes to object it'll throw invalid class exception
     private static final long serialVersionID = 1L;
 
+    public Message(MessageType messageType, int senderId, int generation, Object payload) {
+        this.type = messageType;
+        this.senderId = senderId;
+        this.generation = generation;
+        this.payload = payload;
+    }
+
     public MessageType getType() {
         return type;
     }
@@ -41,5 +48,15 @@ public class Message implements Serializable {
 
     public void setPayload(Object payload) {
         this.payload = payload;
+    }
+
+    @Override
+    public String toString() {
+        return "Message{" +
+                "type=" + type +
+                ", senderId=" + senderId +
+                ", generation=" + generation +
+                ", payload=" + payload +
+                '}';
     }
 }

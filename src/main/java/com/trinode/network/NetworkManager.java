@@ -2,9 +2,7 @@ package com.trinode.network;
 
 import com.trinode.config.NodeConfig;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
+import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Map;
@@ -102,11 +100,39 @@ public class NetworkManager {
             return;
         }
 
-        // implement message sending
-        // get socket for targetNodeId
-        // serialize message using message serializer
-        // send bytes over socket
-        // handle errors
+        // get socket for the target node
+        Socket socket = connections.get(targetNodeId);
+        if (socket == null) {
+            System.out.println("No connection to node " + targetNodeId);
+            return;
+        }
+        // send in a separate thread
+        senderExecutor.submit(() -> {
+            try {
+                // serialize the message
+                byte[] data = MessageSerializer.serialize(message);
+                // get output stream
+                OutputStream out = socket.getOutputStream();
+
+                // write length first (4 bytes) so receiver knows how much to read
+                DataOutputStream dos = new DataOutputStream(out);
+                dos.writeInt(data.length);
+                // write the actual message bytes
+                dos.write(data);
+                dos.flush();
+
+                System.out.println("Node " + nodeId + " sent " + message.getType() + " " + message.getPayload() + " to Node " + targetNodeId + " (" + data.length + " bytes)");
+            } catch (IOException e) {
+                System.err.println("Failed to send message to node " + targetNodeId + ": " + e.getMessage());
+                // connection broken
+                connections.remove(targetNodeId);
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // ignore
+                }
+            }
+        });
 
         System.out.println("Message sent to node: " + targetNodeId);
     }
@@ -164,48 +190,63 @@ public class NetworkManager {
 
     private void connectToNode(int targetNodeId, String address) {
         try {
-            String [] parts = address.split(":");
+            String[] parts = address.split(":");
             String host = parts[0];
             int port = Integer.parseInt(parts[1]);
 
             System.out.println("Node " + nodeId + " connecting to Node " + targetNodeId + " at " + address);
 
             Socket socket = new Socket(host, port);
-            // send our node id first so remote node knows who we are
+
+            // Send our node ID first so remote node knows who we are
             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
             out.writeInt(nodeId);
             out.flush();
 
-            // store connection
-            connections.put(targetNodeId, socket);
+            // Atomically store connection - only if not already present
+            Socket existing = connections.putIfAbsent(targetNodeId, socket);
+
+            if (existing != null) {
+                // Someone else already connected, close our socket
+                System.out.println("Node " + nodeId + " already has connection to Node " + targetNodeId +
+                        ", closing duplicate outgoing");
+                socket.close();
+                return;
+            }
+
             System.out.println("Node " + nodeId + " connected to node " + targetNodeId);
-            // start reading messages from this node
-            listenerExecutor.submit(()-> readMessageFromSocket(targetNodeId, socket));
+
+            // Start reading messages from this node
+            listenerExecutor.submit(() -> readMessageFromSocket(targetNodeId, socket));
+
         } catch (IOException e) {
-            System.err.println("Node " + nodeId + " failed to connect to node " + targetNodeId + ": " + e.getMessage());
+            System.err.println("Node " + nodeId + " failed to connect to node " + targetNodeId + ": " +
+                    e.getMessage());
         }
     }
 
     private void handleIncomingConnection(Socket socket) {
         try {
-            // read the remote node's id first
+            // Read the remote node's ID first
             DataInputStream in = new DataInputStream(socket.getInputStream());
             int remoteNodeId = in.readInt();
 
             System.out.println("Node " + nodeId + " identified incoming connection from node " + remoteNodeId);
 
-            // check if we already have a connection to this node
-            if (connections.containsKey(remoteNodeId)) {
-                System.out.println("Node " + nodeId + " already connected to Node " + remoteNodeId + ", closing duplicate");
+            // Atomically store connection - only if not already present
+            Socket existing = connections.putIfAbsent(remoteNodeId, socket);
+
+            if (existing != null) {
+                // Already have a connection, close this incoming one
+                System.out.println("Node " + nodeId + " already connected to Node " + remoteNodeId +
+                        ", closing duplicate incoming");
                 socket.close();
                 return;
             }
 
-            // store connection
-            connections.put(remoteNodeId, socket);
+            // We stored the connection, start reading
+            listenerExecutor.submit(() -> readMessageFromSocket(remoteNodeId, socket));
 
-            // start reading messages from this node
-            readMessageFromSocket(remoteNodeId, socket);
         } catch (IOException e) {
             System.err.println("Error handling incoming connection: " + e.getMessage());
             try {
@@ -217,13 +258,58 @@ public class NetworkManager {
     }
 
     private void readMessageFromSocket(int remoteNodeId, Socket socket) {
-        // loop while running
-        // read bytes from socket
-        // deserialize
-        // call messagehandler.onmessage(remoteNodeId, message)
-        // handle disconnections
+        System.out.println("Node " + nodeId + " started reading messages from Node " + remoteNodeId);
 
-        System.out.println("Read messages from node " + remoteNodeId);
+        try (socket) {
+            DataInputStream dis = new DataInputStream(socket.getInputStream());
+
+            while (running.get() && !socket.isClosed()) {
+                try {
+                    // read message length first
+                    int length = dis.readInt();
+
+                    if (length <= 0 || length > 10_000_000) { // sanity check (10 MB max)
+                        System.err.println("Invalid message length: " + length);
+                    }
+
+                    // read the exact number of bytes
+                    byte[] data = new byte[length];
+                    dis.readFully(data); // blocks until all bytes read
+
+                    // deserialize to message
+                    Message message = MessageSerializer.deserialize(data);
+
+                    System.out.println("Node " + nodeId + " received " + message.getType() + " from Node " + remoteNodeId + " (" + length + " bytes)");
+
+                    // call message handler if set
+                    if (messageHandler != null) {
+                        messageHandler.onMessage(remoteNodeId, message);
+                    } else {
+                        System.err.println("No message handler set, dropping message");
+                    }
+                } catch (EOFException e) {
+                    // connection closed by remote node
+                    System.err.println("Node " + remoteNodeId + " disconnected");
+                    break;
+                } catch (IOException e) {
+                    if (running.get()) {
+                        System.err.println("Error reading from node " + remoteNodeId + ": " + e.getMessage());
+                    }
+                    break;
+                } catch (ClassNotFoundException e) {
+                    System.err.println("Failed to deserialize message: " + e.getMessage());
+                    // continue reading, don't break on one bad message
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("Failed to get input stream from node " + remoteNodeId);
+        } finally {
+            // clean up connections
+            connections.remove(remoteNodeId);
+            //ignore
+            // ignored
+            System.out.println("Node " + nodeId + " stopped reading from Node " + remoteNodeId);
+        }
     }
 
     private void closeAllConnections() {
