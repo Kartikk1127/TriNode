@@ -53,8 +53,8 @@ public class NetworkManager {
         running.set(true);
 
         // initialize thread pools
-        listenerExecutor = Executors.newFixedThreadPool(3);
-        senderExecutor = Executors.newFixedThreadPool(3);
+        listenerExecutor = Executors.newCachedThreadPool();
+        senderExecutor = Executors.newCachedThreadPool();
 
         // start socket listener
         startServerListener();
@@ -203,22 +203,23 @@ public class NetworkManager {
             out.writeInt(nodeId);
             out.flush();
 
-            // Atomically store connection - only if not already present
-            Socket existing = connections.putIfAbsent(targetNodeId, socket);
-
-            if (existing != null) {
-                // Someone else already connected, close our socket
-                System.out.println("Node " + nodeId + " already has connection to Node " + targetNodeId +
-                        ", closing duplicate outgoing");
+            if (nodeId < targetNodeId) {
+                // we are lower - our outgoing is canonical, store it.
+                Socket old = connections.put(targetNodeId, socket);
+                if (old!=null) {
+                    // let its reader die naturally
+                    try {
+                        old.close();
+                    } catch (IOException ignored){}
+                }
+                System.out.println("Node " + nodeId + " stored canonical outgoing to Node " + targetNodeId);
+                listenerExecutor.submit(() -> readMessageFromSocket(targetNodeId, socket));
+            } else {
+                // we are higher - our outgoing is non-canonical, close it.
+                System.out.println("Node " +  nodeId + " dropping non-canonical outgoing to Node " + targetNodeId);
+                sendConnectionClose(socket);
                 socket.close();
-                return;
             }
-
-            System.out.println("Node " + nodeId + " connected to node " + targetNodeId);
-
-            // Start reading messages from this node
-            listenerExecutor.submit(() -> readMessageFromSocket(targetNodeId, socket));
-
         } catch (IOException e) {
             System.err.println("Node " + nodeId + " failed to connect to node " + targetNodeId + ": " +
                     e.getMessage());
@@ -233,19 +234,22 @@ public class NetworkManager {
 
             System.out.println("Node " + nodeId + " identified incoming connection from node " + remoteNodeId);
 
-            // Atomically store connection - only if not already present
-            Socket existing = connections.putIfAbsent(remoteNodeId, socket);
-
-            if (existing != null) {
-                // Already have a connection, close this incoming one
-                System.out.println("Node " + nodeId + " already connected to Node " + remoteNodeId +
-                        ", closing duplicate incoming");
+            if (remoteNodeId < nodeId) {
+                // incoming from lower node - store it
+                Socket old = connections.put(remoteNodeId, socket);
+                if (old != null) {
+                    try {
+                        old.close();
+                    } catch (IOException ignored) {}
+                }
+                System.out.println("Node " + nodeId + " stored canonical incoming from Node " + remoteNodeId);
+                listenerExecutor.submit(() -> readMessageFromSocket(remoteNodeId, socket));
+            } else {
+                // incoming from higher node - non-canonical group
+                System.out.println("Node " + nodeId + " dropping non-canonical incoming from Node: " + remoteNodeId);
+                sendConnectionClose(socket);
                 socket.close();
-                return;
             }
-
-            // We stored the connection, start reading
-            listenerExecutor.submit(() -> readMessageFromSocket(remoteNodeId, socket));
 
         } catch (IOException e) {
             System.err.println("Error handling incoming connection: " + e.getMessage());
@@ -257,8 +261,20 @@ public class NetworkManager {
         }
     }
 
+    private void sendConnectionClose(Socket socket) {
+        try {
+            Message closeMsg = new Message(MessageType.CONNECTION_CLOSE, nodeId, 0, "");
+            byte[] data = MessageSerializer.serialize(closeMsg);
+            DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
+            dos.writeInt(data.length);
+            dos.write(data);
+            dos.flush();
+        } catch (IOException ignored) {}
+    }
+
     private void readMessageFromSocket(int remoteNodeId, Socket socket) {
         System.out.println("Node " + nodeId + " started reading messages from Node " + remoteNodeId);
+        boolean intentionalClose = false;
 
         try (socket) {
             DataInputStream dis = new DataInputStream(socket.getInputStream());
@@ -270,6 +286,7 @@ public class NetworkManager {
 
                     if (length <= 0 || length > 10_000_000) { // sanity check (10 MB max)
                         System.err.println("Invalid message length: " + length);
+                        continue;
                     }
 
                     // read the exact number of bytes
@@ -279,8 +296,13 @@ public class NetworkManager {
                     // deserialize to message
                     Message message = MessageSerializer.deserialize(data);
 
-                    System.out.println("Node " + nodeId + " received " + message.getType() + " from Node " + remoteNodeId + " (" + length + " bytes)");
+                    System.out.println("Node " + nodeId + " received " + message.getType() + " " + message.getPayload() + " " + " from Node " + remoteNodeId + " (" + length + " bytes)");
 
+                    if (message.getType()==MessageType.CONNECTION_CLOSE) {
+                        System.out.println("Node " + nodeId + " received CONNECTION_CLOSE from Node: " + remoteNodeId + ", closing cleanly");
+                        intentionalClose = true;
+                        break;
+                    }
                     // call message handler if set
                     if (messageHandler != null) {
                         messageHandler.onMessage(remoteNodeId, message);
@@ -306,9 +328,20 @@ public class NetworkManager {
         } finally {
             // clean up connections
             connections.remove(remoteNodeId);
-            //ignore
-            // ignored
             System.out.println("Node " + nodeId + " stopped reading from Node " + remoteNodeId);
+            if (running.get() && !intentionalClose) {
+                System.out.println("Node " + nodeId + " attempting reconnect to Node " + remoteNodeId);
+                reconnect(remoteNodeId);
+            }
+        }
+    }
+
+    private void reconnect(int targetNodeId) {
+        String address = config.getNodeAddress(targetNodeId);
+        if (address!=null) {
+            senderExecutor.submit(() -> connectToNode(targetNodeId, address));
+        } else {
+            System.err.println("Node " + nodeId + " has no address for Node " + targetNodeId + ", cannot reconnect");
         }
     }
 

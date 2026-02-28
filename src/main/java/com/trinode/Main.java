@@ -38,15 +38,15 @@ public class Main {
         Thread.sleep(1000);
 
         // test 2: send message from node2 to node3
-        System.out.println("Test 1: Node 2 -> Node 3");
+        System.out.println("Test 2: Node 2 -> Node 3");
         Message message2 = new Message(MessageType.HEARTBEAT, 2, 0, "Hello from Node 2");
-        node1.getNetworkManager().sendMessage(3, message2);
+        node2.getNetworkManager().sendMessage(3, message2);
         Thread.sleep(1000);
 
         // broadcast from node3 to all
-        System.out.println("Test 1: Node 3 -> BROADCAST");
+        System.out.println("Test 3: Node 3 -> BROADCAST");
         Message message3 = new Message(MessageType.HEARTBEAT, 3, 0, "Broadcast from Node 3");
-        node1.getNetworkManager().broadcastMessage(message3);
+        node3.getNetworkManager().broadcastMessage(message3);
         Thread.sleep(1000);
 
         // datastore operations
