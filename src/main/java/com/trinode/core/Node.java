@@ -5,6 +5,7 @@ import com.trinode.network.Message;
 import com.trinode.network.NetworkManager;
 import com.trinode.storage.DataStore;
 
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Node {
@@ -15,6 +16,7 @@ public class Node {
     private final AtomicBoolean isRunning;
     private final NetworkManager networkManager;
     private final NodeConfig config;
+    private ScheduledExecutorService heartbeatScheduler;
 
     public Node(int nodeId, NodeConfig config) {
         this.nodeId = nodeId;
@@ -51,7 +53,18 @@ public class Node {
 
         networkManager.start();
 
-        // start heartbeat threads
+        // register failure handler
+        networkManager.setFailureHandler(new NetworkManager.NodeFailureHandler() {
+            @Override
+            public void onNodeDead(int deadNodeId) {
+                System.out.println("Node " + nodeId + " notified: Node " + deadNodeId + " is DEAD");
+            }
+
+            @Override
+            public void onNodeRecovered(int recoveredNodeId) {
+                System.out.println("Node " + nodeId + " notified: Node " + recoveredNodeId + " is RECOVERED");
+            }
+        });
         // trigger leader election
 
         System.out.println("Node " + nodeId + " started as " + role);
@@ -89,7 +102,9 @@ public class Node {
 
         System.out.println("Node " + nodeId + " stopping now...");
 
-        // stop heartbeat threads
+        if (heartbeatScheduler!=null) {
+            heartbeatScheduler.shutdownNow();
+        }
         // close network conditions
 
         networkManager.stop();

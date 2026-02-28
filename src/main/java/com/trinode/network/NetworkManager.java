@@ -6,9 +6,7 @@ import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class NetworkManager {
@@ -31,6 +29,12 @@ public class NetworkManager {
 
     // message handler (callback when message received)
     private MessageHandler messageHandler;
+    private final Map<Integer, Long> lastHeartbeatTime;
+    private final Map<Integer, NodeStatus> peerStatus;
+    private final Map<Integer, ScheduledFuture<?>> watchdogTimers;
+    private ScheduledExecutorService heartbeatScheduler;
+    private NodeFailureHandler failureHandler;
+
 
     public NetworkManager(int nodeId, int port, NodeConfig config) {
         this.nodeId = nodeId;
@@ -38,6 +42,9 @@ public class NetworkManager {
         this.config = config;
         this.connections = new ConcurrentHashMap<>();
         this.running = new AtomicBoolean(false);
+        this.lastHeartbeatTime = new ConcurrentHashMap<>();
+        this.peerStatus = new ConcurrentHashMap<>();
+        this.watchdogTimers = new ConcurrentHashMap<>();
     }
 
     // start the network manager
@@ -55,6 +62,7 @@ public class NetworkManager {
         // initialize thread pools
         listenerExecutor = Executors.newCachedThreadPool();
         senderExecutor = Executors.newCachedThreadPool();
+        startHeartbeatSender();
 
         // start socket listener
         startServerListener();
@@ -88,6 +96,9 @@ public class NetworkManager {
         }
         if (senderExecutor!=null) {
             senderExecutor.shutdownNow();
+        }
+        if (heartbeatScheduler!=null) {
+            heartbeatScheduler.shutdownNow();
         }
 
         System.out.println("NetworkManager stopped");
@@ -147,6 +158,10 @@ public class NetworkManager {
     // set the message handler (callback for received message)
     public void setMessageHandler(MessageHandler handler) {
         this.messageHandler = handler;
+    }
+
+    public void setFailureHandler(NodeFailureHandler handler) {
+        this.failureHandler = handler;
     }
 
     private void startServerListener() {
@@ -213,6 +228,7 @@ public class NetworkManager {
                     } catch (IOException ignored){}
                 }
                 System.out.println("Node " + nodeId + " stored canonical outgoing to Node " + targetNodeId);
+                startWatchDog(targetNodeId);
                 listenerExecutor.submit(() -> readMessageFromSocket(targetNodeId, socket));
             } else {
                 // we are higher - our outgoing is non-canonical, close it.
@@ -243,6 +259,7 @@ public class NetworkManager {
                     } catch (IOException ignored) {}
                 }
                 System.out.println("Node " + nodeId + " stored canonical incoming from Node " + remoteNodeId);
+                startWatchDog(remoteNodeId);
                 listenerExecutor.submit(() -> readMessageFromSocket(remoteNodeId, socket));
             } else {
                 // incoming from higher node - non-canonical group
@@ -303,6 +320,16 @@ public class NetworkManager {
                         intentionalClose = true;
                         break;
                     }
+                    if (message.getType() == MessageType.HEARTBEAT) {
+                        lastHeartbeatTime.put(remoteNodeId, System.currentTimeMillis());
+                        if (peerStatus.get(remoteNodeId)==NodeStatus.DEAD) {
+                            System.out.println("Node " + nodeId + " detected node " + remoteNodeId + " recovered.");
+                            peerStatus.put(remoteNodeId, NodeStatus.ALIVE);
+                            if (failureHandler != null) {
+                                failureHandler.onNodeRecovered(remoteNodeId);
+                            }
+                        }
+                    }
                     // call message handler if set
                     if (messageHandler != null) {
                         messageHandler.onMessage(remoteNodeId, message);
@@ -328,6 +355,7 @@ public class NetworkManager {
         } finally {
             // clean up connections
             connections.remove(remoteNodeId);
+            stopWatchdog(remoteNodeId);
             System.out.println("Node " + nodeId + " stopped reading from Node " + remoteNodeId);
             if (running.get() && !intentionalClose) {
                 System.out.println("Node " + nodeId + " attempting reconnect to Node " + remoteNodeId);
@@ -366,8 +394,54 @@ public class NetworkManager {
         }
     }
 
+    private void startHeartbeatSender() {
+        heartbeatScheduler = Executors.newSingleThreadScheduledExecutor();
+        heartbeatScheduler.scheduleAtFixedRate(() -> {
+            if (!running.get()) return;
+            Message heartbeat = new Message(MessageType.HEARTBEAT, nodeId, 0, "");
+            broadcastMessage(heartbeat);
+        },0,1,TimeUnit.SECONDS);
+    }
+
+    private void startWatchDog(int peerId) {
+        // initialize last heartbeat time to now so we don't immediately mark as dead
+        lastHeartbeatTime.put(peerId, System.currentTimeMillis());
+        peerStatus.put(peerId, NodeStatus.ALIVE);
+
+        ScheduledFuture<?> watchDog = heartbeatScheduler.scheduleAtFixedRate(() -> {
+            if (!running.get()) return;
+            Long last = lastHeartbeatTime.get(peerId);
+            if (last == null) return;
+
+            long elapsed = System.currentTimeMillis() - last;
+            if (elapsed > 3000 && peerStatus.get(peerId) == NodeStatus.ALIVE) {
+                System.out.println("Node " + nodeId + " detected node " + peerId + " as Dead.");
+                peerStatus.put(peerId, NodeStatus.DEAD);
+                connections.remove(peerId);
+                if (failureHandler != null) {
+                    failureHandler.onNodeDead(peerId);
+                }
+            }
+        }, 500, 500, TimeUnit.MILLISECONDS);
+        watchdogTimers.put(peerId, watchDog);
+    }
+
+    private void stopWatchdog(int peerId) {
+        ScheduledFuture<?> watchdog = watchdogTimers.remove(peerId);
+        if (watchdog != null) {
+            watchdog.cancel(false);
+        }
+        lastHeartbeatTime.remove(peerId);
+        peerStatus.remove(peerId);
+    }
+
     // callback interface for handling received messages
     public interface MessageHandler {
         void onMessage(int fromNodeId, Message message);
+    }
+
+    public interface NodeFailureHandler {
+        void onNodeDead(int nodeId);
+        void onNodeRecovered(int nodeId);
     }
 }
